@@ -1,0 +1,28 @@
+{
+  "name": "komply-screener",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Company financials screener — denormalized SIREN×year×metric table with pre-computed ratios + YoY/CAGR. Built nightly from the deduped inpi_financial_statements_{ftp,api,ex} merged view. Independent workspace; only depends on DATA Postgres.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "migrate": "tsx src/runMigrations.ts",
+    "screener:full": "tsx scripts/build-screener.ts --full",
+    "screener:incremental": "tsx scripts/build-screener.ts",
+    "screener:cron": "tsx scripts/build-screener-cron.ts",
+    "screener:backfill-liasse": "tsx scripts/backfill-liasse-from-compte-resultat.ts",
+    "screener:smoke": "tsx scripts/build-screener.ts --limit=1000 --since=2024-01-01"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
