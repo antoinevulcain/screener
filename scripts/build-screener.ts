@@ -539,40 +539,80 @@ async function* streamSource(pool: Pool, since: Date | null, hardLimit: number |
 }
 
 async function runWindowPass(pool: Pool) {
-  // After all per-row inserts, fill CAGR + 3y flags via window functions.
-  await pool.query(`
-    WITH series AS (
-      SELECT siren, exercise_year,
-             chiffre_affaires, resultat_net, effectif_moyen,
-             LAG(chiffre_affaires, 3) OVER w AS ca_3y_ago,
-             LAG(chiffre_affaires, 5) OVER w AS ca_5y_ago,
-             LAG(resultat_net, 3)     OVER w AS rn_3y_ago,
-             LAG(resultat_net, 5)     OVER w AS rn_5y_ago,
-             LAG(effectif_moyen, 3)   OVER w AS eff_3y_ago,
-             LAG(resultat_net, 1)     OVER w AS rn_1,
-             LAG(resultat_net, 2)     OVER w AS rn_2,
-             LAG(chiffre_affaires, 1) OVER w AS ca_1,
-             LAG(chiffre_affaires, 2) OVER w AS ca_2
-      FROM company_financials_screener
-      WINDOW w AS (PARTITION BY siren ORDER BY exercise_year)
+  // CAGR + 3y flags rely on LAG(N) per siren — needs the full series.
+  // We chunk by siren range to keep each UPDATE small (a single 6.5M-row
+  // UPDATE with window functions takes hours; chunked batches of ~50k sirens
+  // each take seconds and we get progress logs along the way).
+  console.log("[window] computing CAGR + 3y flags…");
+  const t0 = Date.now();
+
+  // Get the siren ranges via percentile sampling — no count(*) on the table.
+  const ranges = await pool.query<{ from_siren: string | null; to_siren: string | null }>(`
+    WITH q AS (
+      SELECT percentile_disc(s) WITHIN GROUP (ORDER BY siren) AS siren_at
+      FROM company_financials_screener,
+           generate_series(0, 1, 0.02) AS s
     )
-    UPDATE company_financials_screener s SET
-      chiffre_affaires_cagr_3y_pct = CASE WHEN series.ca_3y_ago > 0 AND series.chiffre_affaires > 0
-        THEN (POWER(series.chiffre_affaires::float / series.ca_3y_ago, 1.0/3) - 1) * 100 END,
-      chiffre_affaires_cagr_5y_pct = CASE WHEN series.ca_5y_ago > 0 AND series.chiffre_affaires > 0
-        THEN (POWER(series.chiffre_affaires::float / series.ca_5y_ago, 1.0/5) - 1) * 100 END,
-      resultat_net_cagr_3y_pct = CASE WHEN series.rn_3y_ago > 0 AND series.resultat_net > 0
-        THEN (POWER(series.resultat_net::float / series.rn_3y_ago, 1.0/3) - 1) * 100 END,
-      resultat_net_cagr_5y_pct = CASE WHEN series.rn_5y_ago > 0 AND series.resultat_net > 0
-        THEN (POWER(series.resultat_net::float / series.rn_5y_ago, 1.0/5) - 1) * 100 END,
-      effectif_cagr_3y_pct = CASE WHEN series.eff_3y_ago > 0 AND series.effectif_moyen > 0
-        THEN (POWER(series.effectif_moyen::float / series.eff_3y_ago, 1.0/3) - 1) * 100 END,
-      has_grown_3y = (series.chiffre_affaires > series.ca_1 AND series.ca_1 > series.ca_2),
-      is_loss_making_3y = (series.resultat_net < 0 AND series.rn_1 < 0 AND series.rn_2 < 0),
-      is_high_growth = (s.chiffre_affaires_yoy_pct >= 30 AND s.chiffre_affaires >= 1000000)
-    FROM series
-    WHERE s.siren = series.siren AND s.exercise_year = series.exercise_year;
-  `);
+    SELECT siren_at AS from_siren, lead(siren_at) OVER (ORDER BY siren_at) AS to_siren
+    FROM (SELECT DISTINCT siren_at FROM q) x
+  `).then(r => r.rows
+    .map(row => ({ from: row.from_siren ?? "", to: row.to_siren }))
+    .filter(r => r.from)
+  );
+
+  // Fallback : if the percentile query returned nothing, use one chunk.
+  const chunks = ranges.length > 0 ? ranges : [{ from: "000000000", to: null }];
+  console.log(`[window] ${chunks.length} chunks to process`);
+
+  let done = 0;
+  for (const { from, to } of chunks) {
+    const tc = Date.now();
+    const params: unknown[] = [from];
+    let bound = `s.siren >= $1`;
+    if (to) { params.push(to); bound += ` AND s.siren < $2`; }
+
+    const r = await pool.query(`
+      WITH series AS (
+        SELECT siren, exercise_year,
+               chiffre_affaires, resultat_net, effectif_moyen,
+               LAG(chiffre_affaires, 3) OVER w AS ca_3y_ago,
+               LAG(chiffre_affaires, 5) OVER w AS ca_5y_ago,
+               LAG(resultat_net, 3)     OVER w AS rn_3y_ago,
+               LAG(resultat_net, 5)     OVER w AS rn_5y_ago,
+               LAG(effectif_moyen, 3)   OVER w AS eff_3y_ago,
+               LAG(resultat_net, 1)     OVER w AS rn_1,
+               LAG(resultat_net, 2)     OVER w AS rn_2,
+               LAG(chiffre_affaires, 1) OVER w AS ca_1,
+               LAG(chiffre_affaires, 2) OVER w AS ca_2
+        FROM company_financials_screener
+        WHERE ${bound.replace(/s\./g, "")}
+        WINDOW w AS (PARTITION BY siren ORDER BY exercise_year)
+      )
+      UPDATE company_financials_screener s SET
+        chiffre_affaires_cagr_3y_pct = CASE WHEN series.ca_3y_ago > 0 AND series.chiffre_affaires > 0
+          THEN (POWER(series.chiffre_affaires::float / series.ca_3y_ago, 1.0/3) - 1) * 100 END,
+        chiffre_affaires_cagr_5y_pct = CASE WHEN series.ca_5y_ago > 0 AND series.chiffre_affaires > 0
+          THEN (POWER(series.chiffre_affaires::float / series.ca_5y_ago, 1.0/5) - 1) * 100 END,
+        resultat_net_cagr_3y_pct = CASE WHEN series.rn_3y_ago > 0 AND series.resultat_net > 0
+          THEN (POWER(series.resultat_net::float / series.rn_3y_ago, 1.0/3) - 1) * 100 END,
+        resultat_net_cagr_5y_pct = CASE WHEN series.rn_5y_ago > 0 AND series.resultat_net > 0
+          THEN (POWER(series.resultat_net::float / series.rn_5y_ago, 1.0/5) - 1) * 100 END,
+        effectif_cagr_3y_pct = CASE WHEN series.eff_3y_ago > 0 AND series.effectif_moyen > 0
+          THEN (POWER(series.effectif_moyen::float / series.eff_3y_ago, 1.0/3) - 1) * 100 END,
+        has_grown_3y = (series.chiffre_affaires > series.ca_1 AND series.ca_1 > series.ca_2),
+        is_loss_making_3y = (series.resultat_net < 0 AND series.rn_1 < 0 AND series.rn_2 < 0),
+        is_high_growth = (s.chiffre_affaires_yoy_pct >= 30 AND s.chiffre_affaires >= 1000000)
+      FROM series
+      WHERE s.siren = series.siren AND s.exercise_year = series.exercise_year
+        AND ${bound};
+    `, params);
+
+    done += 1;
+    const dt = ((Date.now() - tc) / 1000).toFixed(1);
+    const total = ((Date.now() - t0) / 1000).toFixed(0);
+    console.log(`[window] chunk ${done}/${chunks.length} siren=${from}…${to ?? "∞"} updated=${r.rowCount} in ${dt}s (total ${total}s)`);
+  }
+  console.log(`[window] done in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 
 export type RunOptions = { full?: boolean; sinceISO?: string | null; limit?: number | null };

@@ -11,7 +11,8 @@
     "screener:incremental": "tsx scripts/build-screener.ts",
     "screener:cron": "tsx scripts/build-screener-cron.ts",
     "screener:backfill-liasse": "tsx scripts/backfill-liasse-from-compte-resultat.ts",
-    "screener:smoke": "tsx scripts/build-screener.ts --limit=1000 --since=2024-01-01"
+    "screener:smoke": "tsx scripts/build-screener.ts --limit=1000 --since=2024-01-01",
+    "screener:window": "tsx scripts/window-pass.ts"
   },
   "dependencies": {
     "pg": "^8.13.1"
