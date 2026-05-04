@@ -540,36 +540,32 @@ async function* streamSource(pool: Pool, since: Date | null, hardLimit: number |
 
 async function runWindowPass(pool: Pool) {
   // CAGR + 3y flags rely on LAG(N) per siren — needs the full series.
-  // We chunk by siren range to keep each UPDATE small (a single 6.5M-row
-  // UPDATE with window functions takes hours; chunked batches of ~50k sirens
-  // each take seconds and we get progress logs along the way).
-  console.log("[window] computing CAGR + 3y flags…");
+  // Chunk by siren-prefix bucket : siren >= 'XX0000000' AND siren < 'YY0000000'.
+  // Same logic as scripts/window-pass.ts (kept in sync — change both together).
+  console.log("[window] computing CAGR + 3y flags in 50 chunks…");
   const t0 = Date.now();
 
-  // Get the siren ranges via percentile sampling — no count(*) on the table.
-  const ranges = await pool.query<{ from_siren: string | null; to_siren: string | null }>(`
-    WITH q AS (
-      SELECT percentile_disc(s) WITHIN GROUP (ORDER BY siren) AS siren_at
-      FROM company_financials_screener,
-           generate_series(0, 1, 0.02) AS s
-    )
-    SELECT siren_at AS from_siren, lead(siren_at) OVER (ORDER BY siren_at) AS to_siren
-    FROM (SELECT DISTINCT siren_at FROM q) x
-  `).then(r => r.rows
-    .map(row => ({ from: row.from_siren ?? "", to: row.to_siren }))
-    .filter(r => r.from)
-  );
-
-  // Fallback : if the percentile query returned nothing, use one chunk.
-  const chunks = ranges.length > 0 ? ranges : [{ from: "000000000", to: null }];
-  console.log(`[window] ${chunks.length} chunks to process`);
+  const N_CHUNKS = 50;
+  const step = Math.ceil(100 / N_CHUNKS);
+  const chunks: { from: string; to: string | null }[] = [];
+  for (let i = 0; i < 100; i += step) {
+    const from = i.toString().padStart(2, "0");
+    const next = i + step;
+    const to = next >= 100 ? null : next.toString().padStart(2, "0");
+    chunks.push({ from, to });
+  }
+  console.log(`[window] ${chunks.length} chunks (siren prefix buckets)`);
 
   let done = 0;
+  let totalUpdated = 0;
   for (const { from, to } of chunks) {
     const tc = Date.now();
-    const params: unknown[] = [from];
-    let bound = `s.siren >= $1`;
-    if (to) { params.push(to); bound += ` AND s.siren < $2`; }
+    const fromKey = from + "0000000";
+    const toKey = to ? to + "0000000" : null;
+    const params: unknown[] = [fromKey];
+    const inner = toKey ? `siren >= $1 AND siren < $2` : `siren >= $1`;
+    if (toKey) params.push(toKey);
+    const outer = toKey ? `s.siren >= $1 AND s.siren < $2` : `s.siren >= $1`;
 
     const r = await pool.query(`
       WITH series AS (
@@ -585,7 +581,7 @@ async function runWindowPass(pool: Pool) {
                LAG(chiffre_affaires, 1) OVER w AS ca_1,
                LAG(chiffre_affaires, 2) OVER w AS ca_2
         FROM company_financials_screener
-        WHERE ${bound.replace(/s\./g, "")}
+        WHERE ${inner}
         WINDOW w AS (PARTITION BY siren ORDER BY exercise_year)
       )
       UPDATE company_financials_screener s SET
@@ -604,15 +600,25 @@ async function runWindowPass(pool: Pool) {
         is_high_growth = (s.chiffre_affaires_yoy_pct >= 30 AND s.chiffre_affaires >= 1000000)
       FROM series
       WHERE s.siren = series.siren AND s.exercise_year = series.exercise_year
-        AND ${bound};
+        AND ${outer};
     `, params);
 
     done += 1;
+    totalUpdated += r.rowCount ?? 0;
     const dt = ((Date.now() - tc) / 1000).toFixed(1);
-    const total = ((Date.now() - t0) / 1000).toFixed(0);
-    console.log(`[window] chunk ${done}/${chunks.length} siren=${from}…${to ?? "∞"} updated=${r.rowCount} in ${dt}s (total ${total}s)`);
+    const elapsed = (Date.now() - t0) / 1000;
+    const rate = done / elapsed;
+    const eta = rate > 0 ? Math.round((chunks.length - done) / rate) : 0;
+    console.log(
+      `[window] ${done.toString().padStart(3)}/${chunks.length}` +
+      ` siren ${from}…${to ?? "∞"}` +
+      ` updated=${(r.rowCount ?? 0).toLocaleString().padStart(8)}` +
+      ` chunk=${dt}s` +
+      ` total=${Math.round(elapsed)}s` +
+      ` ETA=${eta}s`,
+    );
   }
-  console.log(`[window] done in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  console.log(`[window] done in ${((Date.now() - t0) / 1000).toFixed(0)}s, total rows updated=${totalUpdated.toLocaleString()}`);
 }
 
 export type RunOptions = { full?: boolean; sinceISO?: string | null; limit?: number | null };
