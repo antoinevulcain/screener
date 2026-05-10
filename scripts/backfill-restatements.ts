@@ -31,6 +31,7 @@
  */
 import { Pool } from "pg";
 import { CERFA_CODE_MAP, type CerfaCodeMeta } from "../src/lib/cerfaCodeMap.js";
+import { runMigrations } from "../src/runMigrations.js";
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const FETCH_BATCH = 5000;
@@ -125,6 +126,12 @@ async function flushLogBatch(pool: Pool, batch: LogRow[]): Promise<void> {
 async function main() {
   const url = process.env.DATABASE_URL_DATA;
   if (!url) throw new Error("DATABASE_URL_DATA required");
+  // Apply pending migrations idempotently — this script writes to
+  // `company_financials_restatement_log`, which is created by
+  // migration 002. Same advisory-lock behavior as the cron + full
+  // build entry points, so a fresh DB or a recent migration is
+  // automatically applied without a separate `npm run migrate` call.
+  await runMigrations(url);
   const pool = new Pool({ connectionString: url, max: 4 });
   const t0 = Date.now();
 

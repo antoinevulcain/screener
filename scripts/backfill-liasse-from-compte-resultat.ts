@@ -29,6 +29,7 @@
 import { Pool } from "pg";
 import { buildRneLiasseFromRawPayload } from "../src/lib/rne/rneFinancialLiasseFromRaw.js";
 import { extractFinancialsFromRneJson } from "../src/lib/rne/extractFinancialsFromRneJson.js";
+import { runMigrations } from "../src/runMigrations.js";
 
 const BATCH_SIZE = 1000;
 
@@ -47,6 +48,8 @@ async function main() {
 
   const url = process.env.DATABASE_URL_DATA;
   if (!url) throw new Error("DATABASE_URL_DATA required");
+  // Same idempotent migrate pattern as the other entry points.
+  await runMigrations(url);
   const pool = new Pool({ connectionString: url, max: 2 });
   let processed = 0, updated = 0, skipped = 0, errored = 0;
   if (dryRun) console.log("[dry-run] no UPDATEs will be issued");

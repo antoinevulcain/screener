@@ -31,6 +31,7 @@
 import { Pool } from "pg";
 import { CERFA_CODE_MAP, type CerfaCodeMeta } from "../src/lib/cerfaCodeMap.js";
 import { computeScreenerRow, type ScreenerRowInput } from "../src/lib/computeRatios.js";
+import { runMigrations } from "../src/runMigrations.js";
 
 type LiassePoste = {
   code: string;
@@ -690,6 +691,12 @@ async function main() {
   const limit = limitStr ? parseInt(limitStr, 10) : null;
   const url = process.env.DATABASE_URL_DATA;
   if (!url) throw new Error("DATABASE_URL_DATA required");
+  // Apply pending migrations idempotently — same behavior as the cron
+  // entry point (build-screener-cron.ts). Without this, running
+  // `screener:full` on a fresh DB or after a schema migration was added
+  // fails with a missing-column / missing-table error. The migration
+  // runner is advisory-locked, so concurrent invocations serialize.
+  await runMigrations(url);
   await runScreener(url, { full, sinceISO, limit });
 }
 

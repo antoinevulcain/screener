@@ -12,6 +12,7 @@
  * values from the same source rows.
  */
 import { Pool } from "pg";
+import { runMigrations } from "../src/runMigrations.js";
 
 const N_CHUNKS = parseInt(
   process.argv.find(a => a.startsWith("--chunks="))?.split("=")[1] ?? "50",
@@ -21,6 +22,8 @@ const N_CHUNKS = parseInt(
 async function main() {
   const url = process.env.DATABASE_URL_DATA;
   if (!url) throw new Error("DATABASE_URL_DATA required");
+  // Same idempotent migrate pattern as the other entry points.
+  await runMigrations(url);
   const pool = new Pool({ connectionString: url, max: 4 });
   const t0 = Date.now();
 
