@@ -572,6 +572,7 @@ async function runWindowPass(pool: Pool) {
       WITH series AS (
         SELECT siren, exercise_year,
                chiffre_affaires, resultat_net, effectif_moyen,
+               chiffre_affaires_yoy_pct,
                LAG(chiffre_affaires, 3) OVER w AS ca_3y_ago,
                LAG(chiffre_affaires, 5) OVER w AS ca_5y_ago,
                LAG(resultat_net, 3)     OVER w AS rn_3y_ago,
@@ -584,24 +585,46 @@ async function runWindowPass(pool: Pool) {
         FROM company_financials_screener
         WHERE ${inner}
         WINDOW w AS (PARTITION BY siren ORDER BY exercise_year)
+      ),
+      new_vals AS (
+        SELECT siren, exercise_year,
+          (CASE WHEN ca_3y_ago > 0 AND chiffre_affaires > 0
+            THEN (POWER(chiffre_affaires::float / ca_3y_ago, 1.0/3) - 1) * 100 END)::real AS ca_cagr_3y,
+          (CASE WHEN ca_5y_ago > 0 AND chiffre_affaires > 0
+            THEN (POWER(chiffre_affaires::float / ca_5y_ago, 1.0/5) - 1) * 100 END)::real AS ca_cagr_5y,
+          (CASE WHEN rn_3y_ago > 0 AND resultat_net > 0
+            THEN (POWER(resultat_net::float / rn_3y_ago, 1.0/3) - 1) * 100 END)::real AS rn_cagr_3y,
+          (CASE WHEN rn_5y_ago > 0 AND resultat_net > 0
+            THEN (POWER(resultat_net::float / rn_5y_ago, 1.0/5) - 1) * 100 END)::real AS rn_cagr_5y,
+          (CASE WHEN eff_3y_ago > 0 AND effectif_moyen > 0
+            THEN (POWER(effectif_moyen::float / eff_3y_ago, 1.0/3) - 1) * 100 END)::real AS eff_cagr_3y,
+          (chiffre_affaires > ca_1 AND ca_1 > ca_2) AS has_grown_3y,
+          (resultat_net < 0 AND rn_1 < 0 AND rn_2 < 0) AS is_loss_making_3y,
+          (chiffre_affaires_yoy_pct >= 30 AND chiffre_affaires >= 1000000) AS is_high_growth
+        FROM series
       )
       UPDATE company_financials_screener s SET
-        chiffre_affaires_cagr_3y_pct = CASE WHEN series.ca_3y_ago > 0 AND series.chiffre_affaires > 0
-          THEN (POWER(series.chiffre_affaires::float / series.ca_3y_ago, 1.0/3) - 1) * 100 END,
-        chiffre_affaires_cagr_5y_pct = CASE WHEN series.ca_5y_ago > 0 AND series.chiffre_affaires > 0
-          THEN (POWER(series.chiffre_affaires::float / series.ca_5y_ago, 1.0/5) - 1) * 100 END,
-        resultat_net_cagr_3y_pct = CASE WHEN series.rn_3y_ago > 0 AND series.resultat_net > 0
-          THEN (POWER(series.resultat_net::float / series.rn_3y_ago, 1.0/3) - 1) * 100 END,
-        resultat_net_cagr_5y_pct = CASE WHEN series.rn_5y_ago > 0 AND series.resultat_net > 0
-          THEN (POWER(series.resultat_net::float / series.rn_5y_ago, 1.0/5) - 1) * 100 END,
-        effectif_cagr_3y_pct = CASE WHEN series.eff_3y_ago > 0 AND series.effectif_moyen > 0
-          THEN (POWER(series.effectif_moyen::float / series.eff_3y_ago, 1.0/3) - 1) * 100 END,
-        has_grown_3y = (series.chiffre_affaires > series.ca_1 AND series.ca_1 > series.ca_2),
-        is_loss_making_3y = (series.resultat_net < 0 AND series.rn_1 < 0 AND series.rn_2 < 0),
-        is_high_growth = (s.chiffre_affaires_yoy_pct >= 30 AND s.chiffre_affaires >= 1000000)
-      FROM series
-      WHERE s.siren = series.siren AND s.exercise_year = series.exercise_year
-        AND ${outer};
+        chiffre_affaires_cagr_3y_pct = nv.ca_cagr_3y,
+        chiffre_affaires_cagr_5y_pct = nv.ca_cagr_5y,
+        resultat_net_cagr_3y_pct     = nv.rn_cagr_3y,
+        resultat_net_cagr_5y_pct     = nv.rn_cagr_5y,
+        effectif_cagr_3y_pct         = nv.eff_cagr_3y,
+        has_grown_3y                 = nv.has_grown_3y,
+        is_loss_making_3y            = nv.is_loss_making_3y,
+        is_high_growth               = nv.is_high_growth
+      FROM new_vals nv
+      WHERE s.siren = nv.siren AND s.exercise_year = nv.exercise_year
+        AND ${outer}
+        AND (
+          s.chiffre_affaires_cagr_3y_pct IS DISTINCT FROM nv.ca_cagr_3y OR
+          s.chiffre_affaires_cagr_5y_pct IS DISTINCT FROM nv.ca_cagr_5y OR
+          s.resultat_net_cagr_3y_pct     IS DISTINCT FROM nv.rn_cagr_3y OR
+          s.resultat_net_cagr_5y_pct     IS DISTINCT FROM nv.rn_cagr_5y OR
+          s.effectif_cagr_3y_pct         IS DISTINCT FROM nv.eff_cagr_3y OR
+          s.has_grown_3y                 IS DISTINCT FROM nv.has_grown_3y OR
+          s.is_loss_making_3y            IS DISTINCT FROM nv.is_loss_making_3y OR
+          s.is_high_growth               IS DISTINCT FROM nv.is_high_growth
+        );
     `, params);
 
     done += 1;
