@@ -120,6 +120,7 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
   let totalWritten = 0;
   let totalScanned = 0;
   for (const { from, to } of chunks) {
+    const chunkLabel = `${(done + 1).toString().padStart(3)}/${chunks.length} siren ${from}…${to ?? "∞"}`;
     const tc = Date.now();
     const fromKey = from + "0000000";
     const toKey = to ? to + "0000000" : null;
@@ -127,6 +128,8 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
     const where = toKey ? `siren >= $1 AND siren < $2` : `siren >= $1`;
     if (toKey) params.push(toKey);
 
+    console.log(`[window] ${chunkLabel} SELECT start`);
+    const tSel = Date.now();
     const res = await pool.query<ChunkedRow>(
       `
       SELECT siren, exercise_year,
@@ -142,8 +145,15 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
       `,
       params,
     );
+    console.log(
+      `[window] ${chunkLabel} SELECT done` +
+      ` rows=${res.rows.length.toLocaleString()}` +
+      ` in ${((Date.now() - tSel) / 1000).toFixed(1)}s`,
+    );
 
+    const tCompute = Date.now();
     const updates: PendingUpdate[] = [];
+    let sirensSeen = 0;
     let i = 0;
     while (i < res.rows.length) {
       const siren = res.rows[i].siren;
@@ -160,11 +170,28 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
           });
         }
       }
+      sirensSeen += 1;
       i = j;
     }
+    console.log(
+      `[window] ${chunkLabel} compute done` +
+      ` sirens=${sirensSeen.toLocaleString()}` +
+      ` toWrite=${updates.length.toLocaleString()}` +
+      ` (skipped ${(res.rows.length - updates.length).toLocaleString()})` +
+      ` in ${((Date.now() - tCompute) / 1000).toFixed(1)}s`,
+    );
 
+    const totalBatches = Math.ceil(updates.length / BATCH_SIZE);
     for (let k = 0; k < updates.length; k += BATCH_SIZE) {
-      await flushUpdates(pool, updates.slice(k, k + BATCH_SIZE));
+      const batchNum = Math.floor(k / BATCH_SIZE) + 1;
+      const slice = updates.slice(k, k + BATCH_SIZE);
+      const tFlush = Date.now();
+      await flushUpdates(pool, slice);
+      console.log(
+        `[window] ${chunkLabel} flush ${batchNum}/${totalBatches}` +
+        ` wrote=${slice.length.toLocaleString()}` +
+        ` in ${((Date.now() - tFlush) / 1000).toFixed(1)}s`,
+      );
     }
 
     done += 1;
@@ -175,10 +202,9 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
     const rate = done / elapsed;
     const eta = rate > 0 ? Math.round((chunks.length - done) / rate) : 0;
     console.log(
-      `[window] ${done.toString().padStart(3)}/${chunks.length}` +
-      ` siren ${from}…${to ?? "∞"}` +
-      ` scanned=${res.rows.length.toLocaleString().padStart(8)}` +
-      ` written=${updates.length.toLocaleString().padStart(8)}` +
+      `[window] ${chunkLabel} CHUNK DONE` +
+      ` scanned=${res.rows.length.toLocaleString()}` +
+      ` written=${updates.length.toLocaleString()}` +
       ` chunk=${dt}s total=${Math.round(elapsed)}s ETA=${eta}s`,
     );
   }
