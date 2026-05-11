@@ -8,6 +8,12 @@
  * exercise_year ascending. Returns one metrics record per input row,
  * in the same order.
  *
+ * NULL handling matches Postgres three-valued logic exactly — in
+ * particular `FALSE AND NULL = FALSE` short-circuits to FALSE, not
+ * NULL. Without this, re-runs would diverge against PG-stored values
+ * (where the original CTE used `AND`) and write back NULL where PG
+ * had stored FALSE — generating heavy trigger work for nothing.
+ *
  * Float math note: storage type is REAL (32-bit). cagrPct() rounds to
  * float32 via Math.fround so the result compares cleanly against what
  * was read back from the DB — otherwise the diff would always fire.
@@ -31,6 +37,38 @@ export interface WindowMetrics {
   has_grown_3y:                 boolean | null;
   is_loss_making_3y:            boolean | null;
   is_high_growth:               boolean | null;
+}
+
+type Tri = boolean | null;
+
+function gt(a: number | null, b: number | null): Tri {
+  return a == null || b == null ? null : a > b;
+}
+
+function lt(a: number | null, b: number | null): Tri {
+  return a == null || b == null ? null : a < b;
+}
+
+function gte(a: number | null, b: number | null): Tri {
+  return a == null || b == null ? null : a >= b;
+}
+
+/**
+ * 3-valued AND matching Postgres:
+ *   FALSE AND anything = FALSE   (short-circuit — this is the key
+ *                                 case that pure null-propagation
+ *                                 gets wrong)
+ *   NULL  AND TRUE     = NULL
+ *   NULL  AND NULL     = NULL
+ *   TRUE  AND TRUE     = TRUE
+ */
+function and3(...vals: Tri[]): Tri {
+  let result: Tri = true;
+  for (const v of vals) {
+    if (v === false) return false;
+    if (v === null)  result = null;
+  }
+  return result;
 }
 
 function cagrPct(now: number | null, prior: number | null, years: number): number | null {
@@ -62,12 +100,9 @@ export function computeWindowMetricsForSiren(rows: WindowSourceRow[]): WindowMet
       resultat_net_cagr_3y_pct:     cagrPct(rn,  rn3,  3),
       resultat_net_cagr_5y_pct:     cagrPct(rn,  rn5,  5),
       effectif_cagr_3y_pct:         cagrPct(eff, eff3, 3),
-      has_grown_3y:
-        ca == null || ca1 == null || ca2 == null ? null : (ca > ca1 && ca1 > ca2),
-      is_loss_making_3y:
-        rn == null || rn1 == null || rn2 == null ? null : (rn < 0 && rn1 < 0 && rn2 < 0),
-      is_high_growth:
-        yoy == null || ca == null ? null : (yoy >= 30 && ca >= 1_000_000),
+      has_grown_3y:                 and3(gt(ca,  ca1), gt(ca1, ca2)),
+      is_loss_making_3y:            and3(lt(rn, 0), lt(rn1, 0), lt(rn2, 0)),
+      is_high_growth:               and3(gte(yoy, 30), gte(ca, 1_000_000)),
     };
   }
   return out;
