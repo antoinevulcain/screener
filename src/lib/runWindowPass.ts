@@ -44,16 +44,29 @@ interface PendingUpdate {
   m: WindowMetrics;
 }
 
+/**
+ * Compare a stored REAL value (as returned by pg-driver — text-parsed float64
+ * that's *close* to but not bit-equal to the underlying float32) against a
+ * freshly computed value (already `Math.fround`-rounded inside cagrPct).
+ * Bringing both sides through Math.fround normalises them to the same float32
+ * representation; without this every row would always diff and re-write.
+ */
+function eqReal(stored: number | null, computed: number | null): boolean {
+  if (stored === null) return computed === null;
+  if (computed === null) return false;
+  return Math.fround(stored) === computed;
+}
+
 function metricsDiffer(stored: ChunkedRow, computed: WindowMetrics): boolean {
   return (
-    stored.chiffre_affaires_cagr_3y_pct !== computed.chiffre_affaires_cagr_3y_pct ||
-    stored.chiffre_affaires_cagr_5y_pct !== computed.chiffre_affaires_cagr_5y_pct ||
-    stored.resultat_net_cagr_3y_pct     !== computed.resultat_net_cagr_3y_pct ||
-    stored.resultat_net_cagr_5y_pct     !== computed.resultat_net_cagr_5y_pct ||
-    stored.effectif_cagr_3y_pct         !== computed.effectif_cagr_3y_pct ||
-    stored.has_grown_3y                 !== computed.has_grown_3y ||
-    stored.is_loss_making_3y            !== computed.is_loss_making_3y ||
-    stored.is_high_growth               !== computed.is_high_growth
+    !eqReal(stored.chiffre_affaires_cagr_3y_pct, computed.chiffre_affaires_cagr_3y_pct) ||
+    !eqReal(stored.chiffre_affaires_cagr_5y_pct, computed.chiffre_affaires_cagr_5y_pct) ||
+    !eqReal(stored.resultat_net_cagr_3y_pct,     computed.resultat_net_cagr_3y_pct) ||
+    !eqReal(stored.resultat_net_cagr_5y_pct,     computed.resultat_net_cagr_5y_pct) ||
+    !eqReal(stored.effectif_cagr_3y_pct,         computed.effectif_cagr_3y_pct) ||
+    stored.has_grown_3y      !== computed.has_grown_3y ||
+    stored.is_loss_making_3y !== computed.is_loss_making_3y ||
+    stored.is_high_growth    !== computed.is_high_growth
   );
 }
 
