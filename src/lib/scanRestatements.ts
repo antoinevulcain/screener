@@ -34,6 +34,10 @@ type LiassePoste = {
 type SourceRow = {
   siren: string;
   date_cloture: string;
+  /** Since migration 006 — restatements are grouped per type_comptes
+   *  so a holding's social-vs-consolidé filings don't pollute each
+   *  other's history. */
+  type_comptes: string | null;
   rne_updated_at: string | null;
   chiffre_affaires: string | number | null;
   resultat_net: string | number | null;
@@ -48,6 +52,7 @@ type FlatValues = Map<string, number | null>;
 type LogRow = {
   siren: string;
   exercise_year: number;
+  type_comptes: string;
   field_name: string;
   old_value: number | null;
   new_value: number | null;
@@ -90,15 +95,16 @@ async function flushLogBatch(pool: Pool, batch: LogRow[], dryRun: boolean): Prom
   if (batch.length === 0 || dryRun) return;
   const params: unknown[] = [];
   const tuples: string[] = [];
+  const COLS_PER_ROW = 8;
   for (let i = 0; i < batch.length; i++) {
     const r = batch[i];
-    const o = i * 7;
-    params.push(r.siren, r.exercise_year, r.field_name, r.old_value, r.new_value, r.source_date_cloture, r.source_rne_updated_at);
-    tuples.push(`($${o+1}, $${o+2}, $${o+3}, $${o+4}, $${o+5}, $${o+6}, $${o+7})`);
+    const o = i * COLS_PER_ROW;
+    params.push(r.siren, r.exercise_year, r.type_comptes, r.field_name, r.old_value, r.new_value, r.source_date_cloture, r.source_rne_updated_at);
+    tuples.push(`($${o+1}, $${o+2}, $${o+3}, $${o+4}, $${o+5}, $${o+6}, $${o+7}, $${o+8})`);
   }
   await pool.query(
     `INSERT INTO company_financials_restatement_log
-       (siren, exercise_year, field_name, old_value, new_value, source_date_cloture, source_rne_updated_at)
+       (siren, exercise_year, type_comptes, field_name, old_value, new_value, source_date_cloture, source_rne_updated_at)
      VALUES ${tuples.join(", ")}`,
     params,
   );
@@ -139,9 +145,12 @@ export async function scanRestatements(pool: Pool, opts: ScanOptions): Promise<S
   let pairsClause = "";
   if (since) {
     params.push(since.toISOString());
+    // Since migration 006 the grouping key is (siren, date_cloture, type_comptes);
+    // we filter incremental work by the same triplet so a single
+    // type's filings don't pull in unrelated peers.
     pairsClause = `
-      AND (siren, date_cloture) IN (
-        SELECT DISTINCT siren, date_cloture
+      AND (siren, date_cloture, COALESCE(type_comptes, 'C')) IN (
+        SELECT DISTINCT siren, date_cloture, COALESCE(type_comptes, 'C')
         FROM inpi_financial_statements_ftp
         WHERE rne_updated_at > $1
       )
@@ -153,7 +162,9 @@ export async function scanRestatements(pool: Pool, opts: ScanOptions): Promise<S
     await client.query(
       `
       DECLARE c_restate NO SCROLL CURSOR FOR
-      SELECT siren, date_cloture::text AS date_cloture, rne_updated_at,
+      SELECT siren, date_cloture::text AS date_cloture,
+             COALESCE(type_comptes, 'C') AS type_comptes,
+             rne_updated_at,
              chiffre_affaires, resultat_net, total_bilan, capitaux_propres, effectif_moyen,
              liasse_postes
       FROM inpi_financial_statements_ftp
@@ -161,7 +172,7 @@ export async function scanRestatements(pool: Pool, opts: ScanOptions): Promise<S
         AND siren IS NOT NULL
         AND date_cloture IS NOT NULL
         ${pairsClause}
-      ORDER BY siren, date_cloture, rne_updated_at NULLS FIRST
+      ORDER BY siren, date_cloture, COALESCE(type_comptes, 'C'), rne_updated_at NULLS FIRST
       `,
       params,
     );
@@ -177,7 +188,10 @@ export async function scanRestatements(pool: Pool, opts: ScanOptions): Promise<S
 
       for (const row of r.rows) {
         sourceRows++;
-        const key = `${row.siren}|${row.date_cloture}`;
+        // Grouping key now includes type_comptes (since migration 006)
+        // — sociaux and consolidé histories are tracked independently.
+        const typeC = row.type_comptes ?? "C";
+        const key = `${row.siren}|${row.date_cloture}|${typeC}`;
         const values = flatten(row);
         const exerciseYear = new Date(row.date_cloture).getUTCFullYear();
 
@@ -198,6 +212,7 @@ export async function scanRestatements(pool: Pool, opts: ScanOptions): Promise<S
                 buffer.push({
                   siren: row.siren,
                   exercise_year: exerciseYear,
+                  type_comptes: typeC,
                   field_name: field,
                   old_value: oldV,
                   new_value: newV,

@@ -284,9 +284,12 @@ function rowToInsertParams(row: SourceRow, ctx: SirenContext | null) {
     date_cloture: row.date_cloture,
     exercise_year: new Date(row.date_cloture).getUTCFullYear(),
     duree_exercice_mois: dureeMois,
-    type_comptes: row.type_comptes,
-    type_bilan: row.type_comptes === "consolide" ? "CONSO" :
-                row.type_comptes === "simplifie" ? "RS" : "RN",
+    // type_comptes is part of the PK since migration 006 → never NULL.
+    // Most source rows with NULL are sociaux that the INPI export
+    // didn't tag; default them to 'C' (Complets / sociaux).
+    type_comptes: row.type_comptes ?? "C",
+    type_bilan: row.type_comptes === "consolide" || row.type_comptes === "K" ? "CONSO" :
+                row.type_comptes === "simplifie" || row.type_comptes === "S" ? "RS" : "RN",
     is_confidential: row.confidentialite === "confidentiel",
     source: row.chiffre_affaires != null ? "rne" : (row.ocr_chiffre_affaires != null ? "ocr" : "rne"),
     naf_code: ctx?.naf_code ?? null,
@@ -389,15 +392,21 @@ function buildValuesTuple(rowIdx: number): string {
 /** Build the static INSERT prefix once. */
 const INSERT_SQL_PREFIX = (() => {
   const cols = ALL_INSERT_COLUMNS.map(c => `"${c}"`).join(", ");
-  // ON CONFLICT update set: every column except siren, exercise_year (the PK)
-  // gets set to EXCLUDED.col. (We use computed_at = now() implicitly.)
+  // ON CONFLICT update set: every column except the PK (siren,
+  // exercise_year, type_comptes — since migration 006) gets set to
+  // EXCLUDED.col. (We use computed_at = now() implicitly.)
+  //
+  // The PK now includes `type_comptes` so a holding that files BOTH
+  // sociaux ('C') and consolidé ('K') for the same year gets TWO rows
+  // instead of one upserting over the other. The frontend toggles
+  // between them via the `include_consolidated` flag on /screener.
   const updateSet = ALL_INSERT_COLUMNS
-    .filter(c => c !== "siren" && c !== "exercise_year")
+    .filter(c => c !== "siren" && c !== "exercise_year" && c !== "type_comptes")
     .map(c => `"${c}" = EXCLUDED."${c}"`)
     .join(", ");
   return {
     head: `INSERT INTO company_financials_screener (${cols}) VALUES `,
-    tail: ` ON CONFLICT (siren, exercise_year) DO UPDATE SET ${updateSet}, computed_at = now()`,
+    tail: ` ON CONFLICT (siren, exercise_year, type_comptes) DO UPDATE SET ${updateSet}, computed_at = now()`,
   };
 })();
 
