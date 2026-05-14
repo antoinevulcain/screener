@@ -4,12 +4,16 @@
  *
  * Flow per chunk (chunked by 2-char siren prefix):
  *   1. SELECT source rows + current stored multi-year columns,
- *      ordered by (siren, exercise_year).
- *   2. Group by siren, run computeWindowMetricsForSiren in Node.
+ *      ordered by (siren, type_comptes, exercise_year).
+ *   2. Group by (siren, type_comptes), run computeWindowMetricsForSiren
+ *      in Node — sociaux (C) and consolidé (K) are independent series
+ *      and CAGRs must not mix the two (a holding's 700K€ sociaux next
+ *      to its 200Md€ consolidé would yield nonsense CAGRs).
  *   3. Keep only rows where the freshly computed metrics differ from
  *      what's already stored (skip no-op writes).
  *   4. Send batched UPDATEs via unnest(arrays) — one statement per
- *      BATCH_SIZE rows.
+ *      BATCH_SIZE rows; the WHERE clause matches on the (siren,
+ *      exercise_year, type_comptes) PK introduced in migration 006.
  *
  * The DB does plain reads and writes only; the multi-year LAG/CAGR
  * logic runs in Node. No window functions are evaluated in Postgres.
@@ -28,6 +32,7 @@ import {
 const BATCH_SIZE = 5000;
 
 interface ChunkedRow extends WindowSourceRow {
+  type_comptes:                 string;
   chiffre_affaires_cagr_3y_pct: number | null;
   chiffre_affaires_cagr_5y_pct: number | null;
   resultat_net_cagr_3y_pct:     number | null;
@@ -41,6 +46,7 @@ interface ChunkedRow extends WindowSourceRow {
 interface PendingUpdate {
   siren: string;
   exercise_year: number;
+  type_comptes: string;
   m: WindowMetrics;
 }
 
@@ -74,6 +80,7 @@ async function flushUpdates(pool: Pool, batch: PendingUpdate[]): Promise<void> {
   if (batch.length === 0) return;
   const sirens = batch.map(u => u.siren);
   const years  = batch.map(u => u.exercise_year);
+  const types  = batch.map(u => u.type_comptes);
   const ca3    = batch.map(u => u.m.chiffre_affaires_cagr_3y_pct);
   const ca5    = batch.map(u => u.m.chiffre_affaires_cagr_5y_pct);
   const rn3    = batch.map(u => u.m.resultat_net_cagr_3y_pct);
@@ -95,15 +102,17 @@ async function flushUpdates(pool: Pool, batch: PendingUpdate[]): Promise<void> {
       is_loss_making_3y            = v.lossy,
       is_high_growth               = v.hg
     FROM unnest(
-      $1::varchar[], $2::smallint[],
-      $3::real[],    $4::real[],
-      $5::real[],    $6::real[],
-      $7::real[],
-      $8::bool[],    $9::bool[],   $10::bool[]
-    ) AS v(siren, exercise_year, ca3, ca5, rn3, rn5, eff3, grew, lossy, hg)
-    WHERE s.siren = v.siren AND s.exercise_year = v.exercise_year
+      $1::varchar[],  $2::smallint[],  $3::varchar[],
+      $4::real[],     $5::real[],
+      $6::real[],     $7::real[],
+      $8::real[],
+      $9::bool[],     $10::bool[],     $11::bool[]
+    ) AS v(siren, exercise_year, type_comptes, ca3, ca5, rn3, rn5, eff3, grew, lossy, hg)
+    WHERE s.siren = v.siren
+      AND s.exercise_year = v.exercise_year
+      AND s.type_comptes = v.type_comptes
     `,
-    [sirens, years, ca3, ca5, rn3, rn5, eff3, grew, lossy, hg],
+    [sirens, years, types, ca3, ca5, rn3, rn5, eff3, grew, lossy, hg],
   );
 }
 
@@ -145,7 +154,7 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
     const tSel = Date.now();
     const res = await pool.query<ChunkedRow>(
       `
-      SELECT siren, exercise_year,
+      SELECT siren, exercise_year, type_comptes,
              chiffre_affaires, resultat_net, effectif_moyen,
              chiffre_affaires_yoy_pct,
              chiffre_affaires_cagr_3y_pct, chiffre_affaires_cagr_5y_pct,
@@ -154,7 +163,7 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
              has_grown_3y, is_loss_making_3y, is_high_growth
       FROM company_financials_screener
       WHERE ${where}
-      ORDER BY siren, exercise_year
+      ORDER BY siren, type_comptes, exercise_year
       `,
       params,
     );
@@ -166,29 +175,39 @@ export async function runWindowPass(pool: Pool, opts: RunWindowPassOptions = {})
 
     const tCompute = Date.now();
     const updates: PendingUpdate[] = [];
-    let sirensSeen = 0;
+    // We group by (siren, type_comptes) — sociaux and consolidé are
+    // independent series whose CAGRs must be computed separately. The
+    // SELECT's ORDER BY (siren, type_comptes, exercise_year) keeps
+    // identical (siren, type_comptes) rows contiguous.
+    let seriesSeen = 0;
     let i = 0;
     while (i < res.rows.length) {
       const siren = res.rows[i].siren;
+      const typeC = res.rows[i].type_comptes;
       let j = i;
-      while (j < res.rows.length && res.rows[j].siren === siren) j++;
-      const sirenRows = res.rows.slice(i, j);
-      const computed = computeWindowMetricsForSiren(sirenRows);
-      for (let k = 0; k < sirenRows.length; k++) {
-        if (metricsDiffer(sirenRows[k], computed[k])) {
+      while (
+        j < res.rows.length &&
+        res.rows[j].siren === siren &&
+        res.rows[j].type_comptes === typeC
+      ) j++;
+      const seriesRows = res.rows.slice(i, j);
+      const computed = computeWindowMetricsForSiren(seriesRows);
+      for (let k = 0; k < seriesRows.length; k++) {
+        if (metricsDiffer(seriesRows[k], computed[k])) {
           updates.push({
             siren,
-            exercise_year: sirenRows[k].exercise_year,
+            exercise_year: seriesRows[k].exercise_year,
+            type_comptes: typeC,
             m: computed[k],
           });
         }
       }
-      sirensSeen += 1;
+      seriesSeen += 1;
       i = j;
     }
     console.log(
       `[window] ${chunkLabel} compute done` +
-      ` sirens=${sirensSeen.toLocaleString()}` +
+      ` series=${seriesSeen.toLocaleString()}` +
       ` toWrite=${updates.length.toLocaleString()}` +
       ` (skipped ${(res.rows.length - updates.length).toLocaleString()})` +
       ` in ${((Date.now() - tCompute) / 1000).toFixed(1)}s`,
